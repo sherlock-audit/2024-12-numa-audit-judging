@@ -185,6 +185,7 @@ contract FakeCollateral {
 
 }
 ```
+</details>
 
 ### Mitigation
 
