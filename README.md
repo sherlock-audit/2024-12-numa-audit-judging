@@ -4,6 +4,7 @@ Source: https://github.com/sherlock-audit/2024-12-numa-audit-judging/issues/39
 
 ## Found by 
 Vidus, jokr, juaan
+
 ### Summary
 
 [`CNumaToken.leverageStrategy()`](https://github.com/sherlock-audit/2024-12-numa-audit/blob/ae1d7781efb4cb2c3a40c642887ddadeecabb97d/Numa/contracts/lending/CNumaToken.sol#L141) has a `_collateral` token parameter which allows an attacker to pass in a custom `_collateral` token, which acts as a wrapper around the actual collateral token, while also receiving callbacks to enable reentrancy. 
@@ -189,102 +190,13 @@ contract FakeCollateral {
 
 _No response_
 
-# Issue H-2: An attacker can drain NumaVault right after deployment 
-
-Source: https://github.com/sherlock-audit/2024-12-numa-audit-judging/issues/117 
-
-## Found by 
-Oblivionis, jokr
-### Summary
-
-The lending part of the protocol, being a fork of Compound v2, is vulnerable to the empty markets exploit. This vulnerability allows an attacker to drain the funds in NumaVault/cToken markets  if there is a market with zero liquidity.
-
-### Root Cause
-
-The root cause of the attack is a rounding issue in the `redeemUnderlying` function. Whenever a user redeems their underlying tokens  the number of shares to burn is calculated as follows:
-
-```solidity
-shares to burn = underlying token amount / exchangeRate
-```
-
-But instead of rounding up, the number of shares to burn is rounded down in redeemUnderlying function. Due to this, in some cases, one wei fewer number of shares will be burned. The attacker can amplify this rounding error by inflating the `exchangeRate` of the empty market.
-
-```solidity
-    function redeemFresh(address payable redeemer, uint redeemTokensIn, uint redeemAmountIn) internal {
-        require(redeemTokensIn == 0 || redeemAmountIn == 0, "one of redeemTokensIn or redeemAmountIn must be zero");
-        Exp memory exchangeRate = Exp({mantissa: exchangeRateStoredInternal() });
-
-        uint redeemTokens;
-        uint redeemAmount;
-
-        if (redeemTokensIn > 0) {
-            redeemTokens = redeemTokensIn;
-            redeemAmount = mul_ScalarTruncate(exchangeRate, redeemTokensIn);
-        } else {
-@>          redeemTokens = div_(redeemAmountIn, exchangeRate);
-            redeemAmount = redeemAmountIn;
-        }
-
-
-  
-
-@>      totalSupply = totalSupply - redeemTokens;
-        accountTokens[redeemer] = accountTokens[redeemer] - redeemTokens;
-    
-       ...
-
-    }
-```
-
-https://github.com/sherlock-audit/2024-12-numa-audit/blob/main/Numa/contracts/lending/CToken.sol#L639
-
-### Internal pre-conditions
-
-1. There needs to be an empty market without liquidity (which happens during the initial protocol deployment).
-
-### External pre-conditions
-
-_No response_
-
-### Attack Path
-
-1. Let's say the old NumaVault V1 has 500 rETH, and the protocol v2 is redeployed with a new vault and 500 rETH is migrated  to the new vault.  
-2. The newly deployed Compound markets have zero liquidity.  
-3. Let's assume that out of the 500 rETH, 200 rETH is the maxBorrow amount from NumaVault.
-4. Let's say 1 Numa = 0.1 rETH.  
-
----
-
-1. First, the attacker takes a 5000 Numa flashloan.  
-2. The attacker mints cNUMA by depositing a small portion of their Numa into the protocol.  
-3. The attacker redeems most of their cNUMA but leaves 2 wei (a very small amount) of cNUMA shares.  
-4. The attacker donates 5000 Numa to the cNUMA market by directly transferring them to the contract, which significantly inflates the exchange rate of Numa to cNUMA. The exchange rate becomes 2500 Numa per 1 wei of cNUMA due to the donation.  
-5. Currently, there are 2000 Numa (200/0.1) worth of borrowable rETH in the cNUMA market (borrowable rETH from NumaVault).  
-6. The attacker then borrows all the rETH from the rETH market, worth 2000 Numa, using their inflated cNUMA as collateral.  
-7. The attacker redeems 4999.99999999 Numa from their collateral using the `redeemedUnderlying` function. Due to a rounding error, only 1 wei of cNUMA is burned instead of 1.99999999 wei. The protocol still believes the remaining 1 wei of cNUMA is worth 2500 Numa, which covers their active loan, allowing the attacker to withdraw almost all their collateral tokens.  
-8. At this point, the attacker’s borrowing position is fully underwater, and they escape with 200 rETH.
-
-
-
-### Impact
-
-NumaVault can be drained upto max borrowable amount.
-
-### PoC
-
-_No response_
-
-### Mitigation
-
-While calculating the number of cTokens to burn in the `cToken.redeemUnderlying()` function, round up the result instead of rounding down.
-
-
-# Issue H-3: Vault is vulnerable to inflation attack which can cause complete loss of user funds 
+# Issue H-2: Vault is vulnerable to inflation attack which can cause complete loss of user funds 
 
 Source: https://github.com/sherlock-audit/2024-12-numa-audit-judging/issues/253 
 
 ## Found by 
 0xlucky, Abhan1041, AestheticBhai, KupiaSec, Oblivionis, ZZhelev, blutorque, jokr, juaan, novaman33, smbv-1923
+
 ### Summary
 
 Attacker can attack the first depositors in the vault and can steal all users funds. this attack is also famously known has first deposit bug too. while doing this attack , there is no loss of attacker funds, but there is complete loss of user funds. he can complete this attack by front running and then backrunning , means sandwiching user funds. this problem takes place , due to improper use of exchange rate when total supply is 0. 
@@ -331,12 +243,46 @@ _No response_
 
 1000 wei ( some amount)  shares should be burned while first depositing. this is done by uniswap too
 
-# Issue M-1: OracleUtils.ethLeftSide() is not correct for some tokens, leading to incorrect nuAsset pricing 
+# Issue M-1: Debasing/rebasing periods can be decreased by 50% by a malicious actor 
+
+Source: https://github.com/sherlock-audit/2024-12-numa-audit-judging/issues/18 
+
+## Found by 
+000000
+
+### Vulnerability Detail
+
+Upon debasing, we have the following calculation:
+```solidity
+uint ndebase = ((blockTime - lastBlockTime) * debaseValue) / (deltaDebase);
+```
+If the time passed is less than 4320, we round down to 0 (`debaseValue is 20` and `deltaDebase` is 24 hours). However, there is the following check to handle such round downs:
+```solidity
+                if (ndebase <= 0) {
+                    // not enough time has passed to get some debase, so we reset our time reference
+                    blockTime = lastBlockTime;
+                }
+```
+It resets the time to the last block time before the update. However, this can still be abused by a malicious actor by instead rounding to 1. It can also happen during normal conditions by users simply interacting with the protocol at certain times.
+### Attack Path
+
+1. Malicious user calls `VaultManager.getSynthScalingUpdate()` or any other block time state updating function every $4320 * 2 - 1$ seconds
+2. The `ndebase` will equal $(4320 * 2 - 1) * 20 / 86400 = 1,9997685185$ which rounds down to 1
+3. Instead of 2 debasing periods, there will only be 1 which causes the protocol to debase much slower than supposed to, which would keep the CF low and cause huge issues for the protocol
+### Impact
+
+Synthetics will derate slower than intended, which will keep the CF low as users are not incentivized to sell them
+### Mitigation
+
+Refactor the formula
+
+# Issue M-2: OracleUtils.ethLeftSide() is not correct for some tokens, leading to incorrect nuAsset pricing 
 
 Source: https://github.com/sherlock-audit/2024-12-numa-audit-judging/issues/38 
 
 ## Found by 
 juaan
+
 ### Summary
 
 [`OracleUtils::ethLeftSide()`](https://github.com/sherlock-audit/2024-12-numa-audit/blob/ae1d7781efb4cb2c3a40c642887ddadeecabb97d/Numa/contracts/libraries/OracleUtils.sol#L261-L270) is used to check whether ETH is in the numerator or the denominator of the price feed, in order to correctly price the paired asset.
@@ -385,12 +331,13 @@ _No response_
 Check the first 4 bytes of the pricefeed's description string, and return true only if the first 4 bytes are the same as “ETH/”
 This ensures that the function is always correct
 
-# Issue M-2: CF minimum can be bypassed when minting nuAssets 
+# Issue M-3: CF minimum can be bypassed when minting nuAssets 
 
 Source: https://github.com/sherlock-audit/2024-12-numa-audit-judging/issues/41 
 
 ## Found by 
 juaan
+
 ### Summary
 
 CF is checked before minting nuAssets (instead of after), allowing CF to be massively decreased past the warning. This allows assets to be minted even past the critical CF of 110%, breaking the invariant stated in the README. 
@@ -511,245 +458,22 @@ modifier notInWarningCF() {
 
 This ensures that the CF is checked after minting the nuAssets, so it can't be bypassed.
 
-
-
 ## Discussion
 
 **tibthecat**
 
-Not sure about that one. Needs to check with team. The goas we to block minting when CF has already reached WarningCF, not to prevent from reaching this warningCF. 
+Not sure about that one. Needs to check with team. The goal is to block minting when CF has already reached WarningCF, not to prevent from reaching this warningCF. 
 Will check with team, but my current opinion is that it's invalid.
 
-# Issue M-3: In NUMA liquidations, the max liquidation profit value can be greatly exceeded 
 
-Source: https://github.com/sherlock-audit/2024-12-numa-audit-judging/issues/42 
 
-## Found by 
-juaan
-### Summary
-
-The following check is used to limit the liquidator profit in `liquidateNumaBorrower()`:
-
-```solidity
-if (lstLiquidatorProfit > maxLstProfitForLiquidations) {
-    vaultProfit = lstLiquidatorProfit - maxLstProfitForLiquidations;
-}
-```
-
-`lstLiquidatorProfit` is obtained via:
-
-```solidity
-lstLiquidatorProfit = receivedlst - lstProvidedEstimate;
-```
-
-Where `lstProvidedEstimate` is calculated as:
-
-```solidity
-uint lstProvidedEstimate = vaultManager.numaToToken(
-  numaAmount,
-  last_lsttokenvalueWei,
-  decimals,
-  criticalScaleForNumaPriceAndSellFee
-);
-```
-
-Whenever calling [`VaultManager.numaToToken()`](https://github.com/sherlock-audit/2024-12-numa-audit/blob/ae1d7781efb4cb2c3a40c642887ddadeecabb97d/Numa/contracts/NumaProtocol/VaultManager.sol#L694), the vault’s sell fee must be applied to the output to calculate the correct value, and this is evident in the rest of the codebase. 
-
-The issue is that `lstProvidedEstimate` (obtained via `VaultManager.numaToToken()` does not account for the sell fee incurred when NUMA is converted to rETH. This causes the liquidated `numaAmount` to be overvalued, inflating `lstProvidedEstimate`
-
-### Root Cause
-
-Not accounting for sell fee when using `VaultManager.numaToToken()`
-
-### Internal pre-conditions
-
-_No response_
-
-### External pre-conditions
-
-_No response_
-
-### Attack Path
-
-1. Perform a profitable liquidation on a large position.
-2. Profit value exceeds the maximum profit that has been set.
-
-### Impact
-
-Not accounting for the sell fee deflates the `lstLiquidatorProfit` value from the true value, allowing the actual liquidation profit to exceed `maxLstProfitForLiquidations`
-
-### PoC
-
-Add the following test to `Lending.t.sol`:
-
-<details><summary>Foundry test </summary>
-
-```solidity
-function testJ_profitMoreThanMaxProfit() public {
-      // make sure to use the logs to clearly show the info.
-    
-      prepare_numaBorrow_JRV4();
-    
-      vm.roll(block.number + blocksPerYear / 4);
-      cNuma.accrueInterest();
-      (, uint liquidity, uint shortfall, uint badDebt) = comptroller
-          .getAccountLiquidityIsolate(userA, cReth, cNuma);
-      console.log(liquidity);
-      console.log(shortfall);
-      console.log(badDebt);
-      // liquidate
-    
-      vm.startPrank(vault.owner());
-      uint256 sellFee = vaultManager.getSellFeeScalingUpdate();
-    
-      vm.startPrank(userC);
-    
-      uint numaAmountBuy = 1000 ether;
-      rEth.approve(address(vault), 2 * numaAmountBuy);
-      vault.buy(2 * numaAmountBuy, numaAmountBuy, userC);
-    
-      uint balC = rEth.balanceOf(userC);
-      uint numaBalance = numa.balanceOf(userC);
-      uint256 lstValueOfNumaLiquidated = vault.numaToLst(cNuma.borrowBalanceCurrent(userA));
-    
-      (
-          ,
-          uint256 criticalScale,
-    
-      ) = vault.updateVaultAndUpdateDebasing();
-    
-      uint256 noFee_lstValueOfNumaLiquidated 
-      = vaultManager.numaToToken(
-          cNuma.borrowBalanceCurrent(userA),
-          vault.last_lsttokenvalueWei(),
-          1e18,
-          criticalScale
-      );
-    
-      numa.approve(address(vault), numaBalance);
-      vault.liquidateNumaBorrower(userA, type(uint256).max, false, false);
-    
-      console.log("rETH received: %e", rEth.balanceOf(userC) - balC);
-    
-      console.log("rEth value spent: %e", lstValueOfNumaLiquidated);
-      
-      // actual profit greatly exceeds the max profit of 1e19 
-      console.log("profit: %e", (rEth.balanceOf(userC) - balC) - lstValueOfNumaLiquidated);
-    }
-```
-</details>
-
-Note that the max LST liquidation profit is `1e19` (can be checked by adding console logs since there's no getter function).
-
-Console output:
-```bash
-rETH received: 9.33073160044779735711e20
-rEth value spent: 8.76919502042540748925e20
-profit: 5.6153658002238986786e19
-```
-The profit greatly exceeds the `maxLstLiquidatorProfit` of 1e19.
-
-### Mitigation
-
-Use the `numaToLst()` function instead as this accounts for the sell fee:
-
-```diff
--uint lstProvidedEstimate = vaultManager.numaToToken(
--       numaAmount,
--       last_lsttokenvalueWei,
--       decimals,
--        criticalScaleForNumaPriceAndSellFee
-- );
-
-+ uint lstProvidedEstimate = this.numaToLst(numaAmount);
-```
-
-Applying the fix, here is the console output when re-running the PoC:
-
-```bash
-rETH received: 8.86919502042540748925e20
-rEth value spent: 8.76919502042540748925e20
-profit: 1e19
-```
-We can see that the profit is correctly capped at `1e19`
-
-
-
-# Issue M-4: `NumaVault.updateVault()` extracts rewards before accruing interest, leading to unfair borrow interest paid 
-
-Source: https://github.com/sherlock-audit/2024-12-numa-audit-judging/issues/51 
-
-## Found by 
-juaan
-### Summary
-
-In any lending protocol, all actions which affect the interest rate should be performed AFTER accruing interest so far. This is to ensure that interest is accrued fairly. 
-
-For example, if the protocol was untouched for 1 day, and a user was hypothetically able to atomically max out the utilisation ratio before accruing interest for the 1 day, it would cause the borrowers to pay a much high interest rate for the entire day, which does not reflect the actual util ratio over that time period. This is why it's important to accrue interest BEFORE any actions that can change the util ratio / interest rate.
-
-[`NumaVault.updateVault()`](https://github.com/sherlock-audit/2024-12-numa-audit/blob/ae1d7781efb4cb2c3a40c642887ddadeecabb97d/Numa/contracts/NumaProtocol/NumaVault.sol#L533-L539) extracts rewards before accruing interest, leading to unfair borrow interest paid by LST borrowers.
-
-### Root Cause
-
-`NumaVault.updateVault()` extracts rewards before accruing interest, instead of accruing interest first.
-
-### Internal pre-conditions
-
-Users borrow LST
-
-### External pre-conditions
-
-_No response_
-
-### Attack Path
-
-1. Borrowing actions cause util ratio = 50%
-2. Then, after a day, rewards are available to be extracted
-
-**NumaVault.updateVault() is called**
-3. First, it calls `extractRewardsNoRequire()`, which sends rewards to the `rwd_address`, increasing util ratio to 53%
-4. Then, it calls `cLstToken.accrueInterest()`, which accrues interest for the one day, calculating the interest rate based on the util ratio of 53% (even though the borrows for the whole day were held at a util ratio of 50%).
-
-Borrowers pay more interest unfairly.
-
-### Impact
-
-Borrowers pay more interest unfairly
-
-### PoC
-
-_No response_
-
-### Mitigation
-
-Re-arrange the function:
-```diff
-function updateVault() public {
-+   // accrue interest
-+   if (address(cLstToken) != address(0)) cLstToken.accrueInterest();
-
-    // extract rewards if any
-   extractRewardsNoRequire();
-
--   // accrue interest
--   if (address(cLstToken) != address(0)) cLstToken.accrueInterest();
-}
-```
-
-
-
-## Discussion
-
-**tibthecat**
-
-Disagree with that one. Extract rewards should not have any effect on interest rates. As the vault value in Eth does not change (extracted rewards are sent).
-
-# Issue M-5: No RWAs have a chainlink feed in ETH, so RWAs cannot be minted as nuAssets 
+# Issue M-4: No RWAs have a chainlink feed in ETH, so RWAs cannot be minted as nuAssets 
 
 Source: https://github.com/sherlock-audit/2024-12-numa-audit-judging/issues/53 
 
 ## Found by 
 juaan
+
 ### Summary
 
 A key intention of the protocol is to allow RWAs with chainlink feeds to be represented with synthetic nuAssets.
@@ -786,212 +510,13 @@ _No response_
 
 Have a way to convert the ASSET/USD pairs into ASSET/ETH using the ETH/USD price feed.
 
-# Issue M-6: NUMA price can be severely manipulated when `CF < cf_critical`, leading to loss 
-
-Source: https://github.com/sherlock-audit/2024-12-numa-audit-judging/issues/57 
-
-## Found by 
-juaan
-### Summary
-
-Due to the change in the NUMA pricing formula when `CF < cf_critical`, it enables an attacker to manipulate the price atomically to steal funds.
-
-### Root Cause
-
-**Background info for root cause**
-The original formula for the NUMA price is: $\text{numaPrice} = \frac{\text{vaultCollateralValue} - \text{totalSynthValue}}{\text{numaTotalSupply}}$ (with all values in ETH)
-
-Using this formula, when a user burns synthetics to mint NUMA, the NUMA price stays relatively stable because `numaTotalSupply` increases while `totalSynthValue` simultaneously decreases. 
-
-However, when `cf < cf_critical`, the `totalSynthValue` is scaled by `criticalScaleForNumaPriceAndSellFee` which is calculated in the following way:
-```solidity
-uint criticalScaleForNumaPriceAndSellFee = BASE_1000;
-// CRITICAL_CF
-if (currentCF < cf_critical) {
-    uint criticalDebaseFactor = (currentCF * BASE_1000) / cf_critical;
-
-    criticalScaleForNumaPriceAndSellFee = criticalDebaseFactor;
-
-   // OTHER CODE // 
-}
-```
-`currentCF` is calculated via [`getGlobalCF()`](https://github.com/sherlock-audit/2024-12-numa-audit/blob/ae1d7781efb4cb2c3a40c642887ddadeecabb97d/Numa/contracts/NumaProtocol/VaultManager.sol#L922). The calculation can be summarised as `currentCF = totalVaultCollateralValue / totalSynthValue`
-
-By applying this scaling, the new formula for the NUMA price when `currentCF < cf_critical` is:
-
-$\text{numaPrice} = \frac{\text{vaultCollateralValue} - \text{totalSynthValue * currentCF / cfCritical}}{\text{numaTotalSupply}}$ (with all values in ETH)
-
-Now since $\text{currentCF} = \frac{\text{vaultCollateralValue}}{\text{totalSynthValue}}$,
-
-the formula for NUMA price simplifies to:
-
-$\text{numaPrice} = \frac{\text{vaultCollateralValue} - \text{vaultCollateralValue / cfCritical}}{\text{numaTotalSupply}}$ (with all values in ETH)
-
-**The issue**
-When comparing this formula with the original formula, we see that this one is not dependent on the `totalSynthValue`. This is a critical issue because it means that when synthetics are burned to mint NUMA, the `numaTotalSupply` increases, but the numerator remains unchanged. This greatly decreases the NUMA price.
-
-It can be exploited by atomically opening a short leveraged position on NUMA, burning synthetics to NUMA, and closing the short position for profit.
-
-
-
-### Internal pre-conditions
-
-currentCF < cf_critical
-
-### External pre-conditions
-
-_No response_
-
-### Attack Path
-
-_No response_
-
-### Impact
-
-An attacker can atomically manipulate the NUMA price by burning nuAssets, and profit greatly by first opening a large short position on it.
-
-They can also atomically cause rETH borrows to be liquidatable and liquidate them.
-
-### PoC
-Add the following PoC functions to `Printer.t.sol`
-
-<details>
-
-```solidity
-function test_priceManipulationWhenCFCritical() external {
-        
-        // first mint some synths
-        _mintAssetFromNumaInput();
-
-        vm.startPrank(userA);
-        nuUSD.approve(address(moneyPrinter), type(uint256).max);
-
-        console.log("global CF: %e", vaultManager.getGlobalCF());
-        console.log("critical CF: %e", vaultManager.cf_critical());
-
-        // synth scaling critical debase
-        uint256 snapshot = vm.snapshotState();
-        _forceSynthDebasingCritical();
-
-        console.log("AFTER FORCING CRITICAL CF");
-
-        uint256 amountBuy = vaultManager.ethToNuma(
-            1e18,
-            IVaultManager.PriceType.BuyPrice
-        );
-        console.log("[Before Synth Burn] Numa for 1 ETH: %e", amountBuy);
-
-        // SELLING
-        uint256 nuAssetAmount = nuUSD.balanceOf(userA);
-        vm.startPrank(userA);
-        moneyPrinter.burnAssetInputToNuma(
-            address(nuUSD),
-            nuAssetAmount,
-            0,
-            userA
-        );
-
-        amountBuy = vaultManager.ethToNuma(
-            1e18,
-            IVaultManager.PriceType.BuyPrice
-        );
-
-        console.log("[After Synth Burn] Numa for 1 ETH: %e", amountBuy);
-
-
-        ///////// REVERTED STATE ///////////
-        vm.revertToState(snapshot); 
-        console.log("REVERTED STATE TO NORMAL CF_CRITICAL");
-        console.log("critical CF: %e", vaultManager.cf_critical());
-
-        // Price check
-        amountBuy = vaultManager.ethToNuma(
-            1e18,
-            IVaultManager.PriceType.BuyPrice
-        );
-        console.log("Numa for 1 ETH before: %e", amountBuy);
-
-        // SELLING
-        nuAssetAmount = nuUSD.balanceOf(userA);
-        vm.startPrank(userA);
-        moneyPrinter.burnAssetInputToNuma(
-            address(nuUSD),
-            nuAssetAmount,
-            0,
-            userA
-        );
-
-        amountBuy = vaultManager.ethToNuma(
-            1e18,
-            IVaultManager.PriceType.BuyPrice
-        );
-
-        console.log("Numa for 1 ETH after: %e", amountBuy);
-    }
-    
-    function _mintAssetFromNumaInput() public {
-        uint numaAmount = 3.5e24;
-
-        vm.startPrank(deployer);
-        numa.transfer(userA, numaAmount);
-        vm.stopPrank();
-
-        vm.startPrank(userA);
-        numa.approve(address(moneyPrinter), numaAmount);
-        moneyPrinter.mintAssetFromNumaInput(
-            address(nuUSD),
-            numaAmount,
-            0,
-            userA
-        );
-    }
-    function _forceSynthDebasingCritical() public {
-        vm.startPrank(deployer);
-
-        uint globalCF2 = vaultManager.getGlobalCF();
-        console.log(globalCF2);
-
-        // critical_cf
-        vaultManager.setScalingParameters(
-            globalCF2 + 1,
-            vaultManager.cf_warning(),
-            vaultManager.cf_severe(),
-            vaultManager.debaseValue(),
-            vaultManager.rebaseValue(),
-            1 hours,
-            2 hours,
-            vaultManager.minimumScale(),
-            vaultManager.criticalDebaseMult()
-        );
-    }
-```
-
-</details>
-The console output demonstrates the following:
-
-When cf < cf_critical:
-[Before Synth Burn] Numa for 1 ETH: 7.180475215933677256464e21
-[After Synth Burn] Numa for 1 ETH: 6.917607405733951990574e21
-Price change: **(-3.7%)**
-
-When cf > cf_critical:
-[Before Synth Burn] Numa for 1 ETH before: 7.184051273989430565546e21
-[After Synth Burn] Numa for 1 ETH after: 7.132604355406555055698e21
-Price change: **(-0.72%)**
-
-
-
-This shows that the price can be significantly decreased (by burning synths to mint NUMA), due to the calculation not accounting for the total synth value when cf < cf_critical.
-
-### Mitigation
-_No response_
-
-# Issue M-7: Deprecated markets allow profitable exploitation of bad debt liquidations 
+# Issue M-5: Deprecated markets allow profitable exploitation of bad debt liquidations 
 
 Source: https://github.com/sherlock-audit/2024-12-numa-audit-judging/issues/67 
 
 ## Found by 
 t0x1c
+
 ## Summary
 When markets are deprecated in the protocol, bad debt positions can be liquidated using regular liquidation functions instead of the dedicated bad debt liquidation path. This bypasses important safeguards and allows liquidators to extract a profit, worsening the protocol's position even further.
 
@@ -1234,64 +759,22 @@ Overall Severity: Medium
 ## Mitigation
 Add a check that even for deprecated markets, regular (shortfall) liquidation path is not allowed for badDebt positions.
 
-# Issue M-8: The max vault buy can be exceeded 
-
-Source: https://github.com/sherlock-audit/2024-12-numa-audit-judging/issues/98 
-
-## Found by 
-juaan
-### Summary
-
-The oracle used for NUMA collateral/debt pricing is not a traditional chainlink styled oracle. It uses the vault buy/sell price to determine the value of NUMA. The issue with this is that it is atomically manipulatable. 
-
-The protocol aims to limit the price manipulatability via a maximum vault buy, set to 10% of the vault's balance + debt. 
-
-However these maximum vault buys can be repeated many times, buying large amounts of NUMA and raising the price. This allows NUMA borrows to be liquidated, and the attacker can profit via the liquidator bonus.
-
-### Root Cause
-
-Collateral/debt oracle is manipulatable, and the max vault buy is not enforced sufficiently. 
-
-### Internal pre-conditions
-
-_No response_
-
-### External pre-conditions
-
-_No response_
-
-### Attack Path
-
-1. Attacker uses an external flash loan to borrow rETH
-2. Attacker repeatedly buys the maximum amount of NUMA, raising it's price (as long as synth value != 0)
-3. Now that NUMA is more expensive, NUMA borrows can be liquidated, and the attacker can profit via the liquidation bonus
-
-### Impact
-
-Liquidations can be triggered atomically via price manipulation
-
-### PoC
-
-_No response_
-
-### Mitigation
-
-Consider implementing a 'max buy per block'. This ensures that repeated buys in the same transaction can't exceed 10% of the vault's balance+debt.
-
-
-
 ## Discussion
 
 **tibthecat**
 
-Disagree with that one. The goal of max buy, is to force buyers to pay more fees by forcing them to split their buys. Si this is an intended behavior. We want more fees, and we want the numa price to go up.
+As discussed in the dashboard, I think it's LOW because protocol could liquidate any bad debt position before deprecating.
+But still, it's better for us to fix that and use the liquidatebaddebt path even when market is deprecated.
 
-# Issue M-9: Incorrect liquidation mechanics either causes revert on liquidation due to insufficient seizeTokens or causes transition into bad debt 
+
+
+# Issue M-6: Incorrect liquidation mechanics either causes revert on liquidation due to insufficient seizeTokens or causes transition into bad debt 
 
 Source: https://github.com/sherlock-audit/2024-12-numa-audit-judging/issues/101 
 
 ## Found by 
 t0x1c
+
 ## Summary
 The protocol's liquidation mechanics are fundamentally flawed in two distinct ways that emerge when performing liquidations on positions. Either:
 
@@ -1560,12 +1043,33 @@ Add the following 2 checks:
 
 This possibility of a reduced liquidation incentive should be properly documented so that liquidators know the risk in advance.
 
-# Issue M-10: leverageStrategy will revert due users interest rate accrual 
+## Discussion
+
+**tibthecat**
+
+I think it works like compound and as intended for the bad debt part which can be profitable only if there is way to swap collateral at profit on some LP.
+
+About that comment in the dashboard: 
+
+\_"Thank you for the detailed analysis.
+
+For part 2, this was discussed in the "Counterproductive Incentives" section [here](https://blog.openzeppelin.com/compound-audit). This is the liquidation design of Compound.
+
+For part 1, if I'm understanding correctly, due to the existance of minBorrowAmountAllowPartialLiquidation, should be valid. Example: Collateral=100, Debt=95, incentive=12\%, minBorrowAmountAllowPartialLiquidation=200. Then liquidators can only try to liquidate the whole position, which would fail due to not enough collateral (95*112\% = 106.4 > 100).
+
+Changing this to medium severity."\_
+
+I disagree because our goal IS that liquidator liquidate the maximum possible. Because of our maxProfitPerliquidation, we don't want liquidators to split their liquidations. We added that parameter (minBorrowAmountAllowPartialLiquidation) in case there would not be enough liquidity on the chain to perform the liquidation.
+
+
+
+# Issue M-7: leverageStrategy will revert due users interest rate accrual 
 
 Source: https://github.com/sherlock-audit/2024-12-numa-audit-judging/issues/120 
 
 ## Found by 
 KupiaSec, jokr
+
 ### Summary
 
 In the `CNumaToken.leverageStrategy()` function, after borrowing from the market using the `borrowInternalNoTransfer` function, a check is performed to ensure that the user's borrow amount changes only by `borrowAmount` using a `require` statement. However, this check will fail because the user's principal borrow amount will increase by more than `borrowAmount` due to the interest accrued on the user's borrow position.
@@ -1649,12 +1153,13 @@ Instead of directly fetching the user's previous borrow amount from the state us
 ```
 
 
-# Issue M-11: User will Received Less Amount Of Numa 
+# Issue M-8: User will Received Less Amount Of Numa 
 
 Source: https://github.com/sherlock-audit/2024-12-numa-audit-judging/issues/161 
 
 ## Found by 
 Nave765, onthehunt
+
 ### Summary
 
 User will lose some Numa due to precision loss whenever user calls `NumaPrinter::burnAssetInputToNuma`.
@@ -1746,12 +1251,13 @@ _No response_
 Consider changing the precision to 1e18 or bigger than 1000.
 
 
-# Issue M-12: Before transferring `CToken`, the `accrueInterest()` function should be called first. 
+# Issue M-9: Before transferring `CToken`, the `accrueInterest()` function should be called first. 
 
 Source: https://github.com/sherlock-audit/2024-12-numa-audit-judging/issues/168 
 
 ## Found by 
 KupiaSec
+
 ### Summary
 
 Before transferring `CToken`, the `NumaComptroller.transferAllowed()` function is called first to prevent any imbalance between the user's collateral and debt value.
@@ -1823,106 +1329,21 @@ And illegitimate transfers can lead to an imbalance between the sender's collate
 
 Invoke `accrueInterest()` before the transfer.
 
-
-
 ## Discussion
 
 **tibthecat**
 
 This is coming from compound V2 fork. Is compound V2 vulnerable to that too?
 
-# Issue M-13: Full repayment via the `CNumaToken.closeLeverageStrategy()` function is nearly impossible. 
 
-Source: https://github.com/sherlock-audit/2024-12-numa-audit-judging/issues/170 
 
-## Found by 
-KupiaSec
-### Summary
-
-In the `closeLeverageStrategy()` function, `_borrowToRepay` must not exceed `borrowAmountFull`. Here, `_borrowToRepay` represents the repayment amount, while `borrowAmountFull` is the total borrow amount.
-
-For users to achieve a full repayment, they must set `_borrowToRepay` to be exactly equal to `borrowAmountFull`.
-
-However, for ordinary users, this is nearly impossible. While they can view the exact value of `borrowAmountFull` through view functions, the transaction first calls the `accrueInterest()` function, which alters the full borrow amount. Additionally, the exact value of `borrowAmountFull` is scaled by 1e18, making it impossible for users to set the precise amount on the front end.
-
-### Root Cause
-
-As noted at [line 278](https://github.com/sherlock-audit/2024-12-numa-audit/blob/main/Numa/contracts/lending/CNumaToken.sol#L278), the `closeLeverageStrategy()` function requires `_borrowToRepay` to not exceed `borrowAmountFull`.
-
-Given this requirement, line 281 is effectively meaningless.
-
-It would be more appropriate for users to set `_borrowToRepay` to a value greater than `borrowAmountFull`, allowing it to be adjusted in line 281 to match `borrowAmountFull`.
-
-In fact, line 278 is unnecessary and should be removed.
-
-```solidity
-    function closeLeverageStrategy(
-        CNumaToken _collateral,
-        uint _borrowtorepay,
-        uint _strategyIndex
-    ) external {
-        // AUDITV2FIX
-        accrueInterest();
-        _collateral.accrueInterest();
-
-        ...
-
-        uint borrowAmountFull = borrowBalanceStored(msg.sender);
-278     require(borrowAmountFull >= _borrowtorepay, "no borrow");
-
-        
-281     if (_borrowtorepay > borrowAmountFull)
-            _borrowtorepay = borrowAmountFull;
-
-        ...
-    }
-```
-
-### Internal pre-conditions
-
-### External pre-conditions
-
-### Attack Path
-
-### Impact
-
-Full repayment via `closeLeverageStrategy()` is nearly impossible.
-
-### PoC
-
-### Mitigation
-
-Remove the requirement.
-
-```diff
-    function closeLeverageStrategy(
-        CNumaToken _collateral,
-        uint _borrowtorepay,
-        uint _strategyIndex
-    ) external {
-        // AUDITV2FIX
-        accrueInterest();
-        _collateral.accrueInterest();
-
-        ...
-
-        uint borrowAmountFull = borrowBalanceStored(msg.sender);
--       require(borrowAmountFull >= _borrowtorepay, "no borrow");
-
-        
-        if (_borrowtorepay > borrowAmountFull)
-            _borrowtorepay = borrowAmountFull;
-
-        ...
-    }
-```
-
-# Issue M-14: Precision loss in setMaxSpotOffsetBps function leads to Incorrect Numa Prices 
+# Issue M-10: Precision loss in setMaxSpotOffsetBps function leads to Incorrect Numa Prices 
 
 Source: https://github.com/sherlock-audit/2024-12-numa-audit-judging/issues/175 
 
 ## Found by 
 jokr
+
 ### Summary
 
 Due to precision loss in `NumaOracle.setMaxSpotOffsetBps()`, the spot price is modified (increased or decreased) by incorrect percentages, resulting in incorrect prices.
@@ -2006,12 +1427,13 @@ Percentage change (increase): 0.00%
 
 Increase the precision of `_maxSpotOffsetBps` to avoid precision losses.
 
-# Issue M-15: No slippage check for leverageStrategy function 
+# Issue M-11: No slippage check for leverageStrategy function 
 
 Source: https://github.com/sherlock-audit/2024-12-numa-audit-judging/issues/182 
 
 ## Found by 
 jokr
+
 ### Summary
 
 When a user opens a leveraged position using the CNumaToken.leverageStrategy() function, there is no slippage protection to limit the price at which tokens are bought by the strategy contract. As a result, if the tokens are purchased at an unfavorable price, the user may incur more debt than expected. Additionally, the function lacks a deadline parameter to ensure that the transaction is executed within a specified timeframe. Without this parameter, if the transaction is delayed, the user has no control over the price at which the tokens are purchased, increasing their risk.
@@ -2133,12 +1555,15 @@ Add slippage protection for `borrowAmount` in `leverageStrategy` function.
    ```
 Also add slippage protection for `closeLeverageStrategy` function.
 
-# Issue M-16: Numa tokens fee on transfer can be bypassed 
+# Issue M-12: Numa tokens fee on transfer can be bypassed 
 
 Source: https://github.com/sherlock-audit/2024-12-numa-audit-judging/issues/184 
 
+The protocol has acknowledged this issue.
+
 ## Found by 
 jokr
+
 ### Summary
 
 The Numa token is designed in a way that if users want to transfer Numa tokens to a specific address present in `isIncludedInFees`, a fee will be applied. Additionally, if the `spender` address is in the `wlSpenders` list, no fee is charged
@@ -2184,92 +1609,28 @@ _No response_
 
 Change fee on transfer implementation of Numa token
 
-
-
 ## Discussion
 
 **tibthecat**
 
 Irrelevant as current deployed Numa token does not have "on-transfer fee" anymore. And numa.sol should not have been in the audit scope.
 
-# Issue M-17: borrowRateMaxMantissa should be tailored to the specific chain on which the protocol is deployed 
+**c-plus-plus-equals-c-plus-one**
 
-Source: https://github.com/sherlock-audit/2024-12-numa-audit-judging/issues/192 
+> Irrelevant as current deployed Numa token does not have "on-transfer fee" anymore. And numa.sol should not have been in the audit scope.
 
-## Found by 
-AestheticBhai, Vidus, juaan, nikhilx0111
-### Summary
-
-The purpose of borrowRateMaxMantissa is to trigger the protocol's failure mode when excessive utilization causes the borrow rate to become unreasonably high https://github.com/sherlock-audit/2024-12-numa-audit/blob/ae1d7781efb4cb2c3a40c642887ddadeecabb97d/Numa/contracts/lending/CToken.sol#L442-L445
-It is defined as a constant across all chains, but it should ideally be adjusted based on the average block time of the specific chain where the protocol is deployed
-
-    // Maximum borrow rate that can ever be applied (.0005% / block)
-    uint internal constant borrowRateMaxMantissa = 0.0005e16;
-
-borrowRateMaxMantissa = 0.0005e16 translates to maximum borrow rate of .0005% / block.
-For Ethereum chain that has 12 seconds of average block time, this translates to maximum borrow rate of `0.0005% * (365 * 24 * 3600)/12 = 1314`
-
-The protocol will be deployed to three chains: Arbitrum, Base, and Ethereum. Below are the calculations for the maximum borrow rate
-
-- Ethereum (12-second block time):
-  - Blocks per year:  
-    (365 * 24 * 60 * 60) / 12 = 2,628,000
-  - Maximum borrow rate:  
-    0.0005e16 * 2,628,000 = 131.4%
-
-- Base (2-second block time):
-  - Blocks per year:  
-    (365 * 24 * 60 * 60) / 2 = 15,768,000
-  - Maximum borrow rate:  
-    0.0005e16 * 15,768,000 = 788.4%
-
-- Arbitrum (Variable block time):
-  - Average block time: 0.25s to 2s
-  - Blocks per year (assuming 1s block time):  
-    365 * 24 * 60 * 60 = 31,536,000
-  - Maximum borrow rate:  
-    0.0005e16 * 31,536,000 = 1576.8%
+![image](https://github.com/user-attachments/assets/44e294a9-01b5-4dc7-b037-80ad20e5d504)
 
 
 
 
-
-### Root Cause
-
-
-https://github.com/sherlock-audit/2024-12-numa-audit/blob/ae1d7781efb4cb2c3a40c642887ddadeecabb97d/Numa/contracts/lending/CTokenInterfaces.sol#L30-L31
-
-### Internal pre-conditions
-
-_No response_
-
-### External pre-conditions
-
-_No response_
-
-### Attack Path
-
-_No response_
-
-### Impact
-
-configuration values mismatch
-
-### PoC
-
-_No response_
-
-### Mitigation
-borrowRateMaxMantissa should be set to the proper value instead of the current value  change `borrowRateMaxMantissa` according to what chain it is being deployed to.
-
-_No response_
-
-# Issue M-18: Buy fee PID is updated with wrong amounts leading to unexpected fee growth 
+# Issue M-13: Buy fee PID is updated with wrong amounts leading to unexpected fee growth 
 
 Source: https://github.com/sherlock-audit/2024-12-numa-audit-judging/issues/199 
 
 ## Found by 
-Afriaudit, OpaBatyo
+Afriaudit, OpaBatyo, zarkk01
+
 ### Summary
 
 ## Summary
@@ -2348,54 +1709,50 @@ _No response_
 
 Invoke `updateBuyFeePID` with the actual minted amount in `NumaVault.buyNoMax`
 
-# Issue M-19: Redeeming `lstToken` from vault incorrectly checks vault balance before applying a sell fee 
+## Discussion
 
-Source: https://github.com/sherlock-audit/2024-12-numa-audit-judging/issues/203 
+**tibthecat**
+
+I don't think it makes a big difference. But I will check with team.
+
+
+
+# Issue M-14: Vaults can be purposefully bricked by leaving small amounts of rETH 
+
+Source: https://github.com/sherlock-audit/2024-12-numa-audit-judging/issues/220 
+
+The protocol has acknowledged this issue.
 
 ## Found by 
-000000, KupiaSec, OpaBatyo
+OpaBatyo
+
 ### Summary
 
 ## Summary
-Selling Numa for LST in a vault checks fund availability before applying a sell fee. Last person to withdraw won't be able to fully retrieve their funds.
+Any numa holder can sell their numa in any vault, regardless where the tokens came from, allowing Numa holders to have preferential vaults and brick smaller ones by leaving dust amounts of rETH.
 ## Description
-Let's observe the `sell` method in vault and how it performs checks for sufficient liquidity
+Vaults have strict MIN and MAX deposit amounts which can be abused by leaving small amounts in it. One possible attack is a whale Numa holder to sell tokens in a smaller vault in order to cause the MAX deposit amount (10% of current lst balance) to be smaller than the MIN (1000 wei).
 ```solidity
-        uint256 tokenAmount = vaultManager.numaToToken(
-            _numaAmount,
-            last_lsttokenvalueWei,
-            decimals,
-            criticalScaleForNumaPriceAndSellFee
-        );
-        require(tokenAmount > 0, "amount of token is <=0");
-        require(
-            lstToken.balanceOf(address(this)) >= tokenAmount, // @audit checks availability before applying fees below
-            "not enough liquidity in vault"
-        );
-
-
-        if (feeWhitelisted[msg.sender]) {
-            fee = 1 ether;
-        }
-        _tokenOut = (tokenAmount * fee) / 1 ether;            
+        uint256 vaultsBalance = getVaultBalance();
+        uint256 MAX = (max_percent * vaultsBalance) / BASE_1000; // @audit this can be below the constant MIN
+        require(_inputAmount <= MAX, "must trade under max");
 ```
-We see the following flow:
-1. Input numa amount is converted to lst tokens 
-2. A sanity check is performed to see whether the contract has sufficient balance to cover `tokenAmount`
-3. A fee is applied on `tokenAmount` 
+If a vault is left with balance of 9999 wei, MAX will always be smaller than MIN, causing a soft DoS. This attack is relevant even without bricking deposits entirely since a vault can be left with negligible amounts of liquidity and users will be allowed to MAX deposit only a fraction of that. For example:  
 
-This order of execution is incorrect as it disallows a user to entirely pull out the remaining funds in a vault when they have sufficient balance to do so.
-Assume that the user has 100$ worth of tokens, knows there is a 10% sell fee and there are 90$ worth of tokens in the vault. User should be able to request to retrieve his 100$ tokens, pay a 10$ fee and get the remaining balance in the vault. However the require check will fail due to checking the current balance against an amount which is not yet taxed with a fee.
+Vault holds 1 rETH (1e18 wei) currently valued at 3700 USD.  
+Numa holder comes with their liquidity from another vault and burns it, leaving 0.0001 rETH (1e14 wei) or around 0.37 USD
+Any further deposits to this vault can be at most a fraction of 0.37 USD, even if `max_percent = 1000`
 
-User would be able to request multiple transactions to retrieve most of the balance they are entitled to, however a full withdrawal will never be possible. Last person to withdraw from a vault won't be able to fully retrieve what they are owed. 
+Users won't be able to deposit a significant amount in this vault, effectively being pushed away from it or forced to interact with a bigger one. Large liquidity providers can collude and perform such attacks to increase their rewards and interest accrued in a preferential vault.
 
 ### Root Cause
 
-- In [`NumaVault.sell`](https://github.com/sherlock-audit/2024-12-numa-audit/blob/ae1d7781efb4cb2c3a40c642887ddadeecabb97d/Numa/contracts/NumaProtocol/NumaVault.sol#L589-L592), available liquidity is incorrectly checked against a pre-tax amount
+- [`NumaVault.buy`](https://github.com/sherlock-audit/2024-12-numa-audit/blob/ae1d7781efb4cb2c3a40c642887ddadeecabb97d/Numa/contracts/NumaProtocol/NumaVault.sol#L441) allows to only deposit, at most, a fraction of the current liquidity
+- There are no checks in `NumaVault.sell` whether or not the burnt Numa was minted in the same vault
 
 ### Internal pre-conditions
 
-- Last user to withdraw from a vault wants to retrieve their funds
+None
 
 ### External pre-conditions
 
@@ -2403,14 +1760,15 @@ none
 
 ### Attack Path
 
-1. User has 100 tokens, fee is 10%, vault has 90 tokens, user should be able to withdraw all of it 
-2. User attempts to withdraw their entire balance which will cause a revert
-
+1. Whale user mints large amounts of Numa in a big vault
+2. User sells it in smaller vaults, leaving their liquidity at negligible values
+3. Other protocol users can't make a significant deposit in the other vault so they opt for the bigger one
+4. Whale user benefits from the extra liquidity/fees/rewards in the big vault
 
 ### Impact
 
-- logic error
-- partial loss of funds
+- unexpected behaviour
+- protocol can be gamed
 
 ### PoC
 
@@ -2418,5 +1776,5 @@ _No response_
 
 ### Mitigation
 
-Perform the balance check against `_tokenOut` instead of `tokenAmount` 
+Track numa balances internally and allow users to sell tokens only from the vault that initially minted them. Additionally, add a boolean `max_percent_toggle` in the vault and perform a MAX deposit check only when it's on. This way in the scenario where the vault is left with 0.37 USD worth of rETH, admins can turn the `max_percent` check off in order to have the vault's liquidity restored before turning it on again.
 
